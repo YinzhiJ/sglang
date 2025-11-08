@@ -31,6 +31,8 @@ from typing import (
 import huggingface_hub
 import numpy as np
 import torch
+from transformers import AutoTokenizer
+from sglang.srt.models.mixtral_quant import QuantMixtralForCausalLM as MyMoEModel
 
 from sglang.srt.server_args import get_global_server_args
 
@@ -218,17 +220,20 @@ def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
 ) -> nn.Module:
-    """Initialize a model with the given configurations."""
-    model_class, _ = get_model_architecture(model_config)
+    """
+    强行使用我们魔改过的 MoE+RAG-aware 类，而不是框架自动推断出来的 MixtralForCausalLM。
+    这样我们就能把 tokenizer / entropy_threshold 传进去。
+    """
+
+    # 我们不再信任 get_model_architecture 返回的类
+    model_class = MyMoEModel
+
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
-    remap_prefix = getattr(model_class, "remap_prefix", None)
+
     if _is_npu:
         packed_modules_mapping.update(
             {
-                "visual": {
-                    "qkv_proj": ["qkv"],
-                    "gate_up_proj": ["gate_proj", "up_proj"],
-                },
+                "visual": {"qkv_proj": ["qkv"]},
                 "vision_model": {
                     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
                     "proj": ["out_proj"],
@@ -245,21 +250,36 @@ def _initialize_model(
         )
 
     quant_config = _get_quantization_config(
-        model_config, load_config, packed_modules_mapping, remap_prefix
+        model_config, load_config, packed_modules_mapping
     )
 
-    # Build kwargs conditionally
-    kwargs = {
-        "config": model_config.hf_config,
-        "quant_config": quant_config,
-    }
+    # tokenizer：用 HF tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_config.model_path,
+        revision=model_config.revision,
+        trust_remote_code=get_bool_env_var("SGLANG_TRUST_REMOTE_CODE") or False,
+    )
 
-    # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
-    if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
-        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.value
-        kwargs["model_path"] = model_config.model_path
+    # 从环境变量里读熵阈值，默认0.8（你可调）
+    try:
+        entropy_threshold = float(
+            os.environ.get("SGLANG_MOE_ENTROPY_THRESHOLD", "0.8")
+        )
+    except ValueError:
+        entropy_threshold = 0.8
 
-    return model_class(**kwargs)
+    print("[LOADER] using custom MyMoEModel with tokenizer & entropy")
+    print("[LOADER] entropy_threshold =", entropy_threshold)
+
+    # 直接实例化我们的类
+    model = model_class(
+        config=model_config.hf_config,
+        quant_config=quant_config,
+        tokenizer=tokenizer,
+        entropy_threshold=entropy_threshold,
+    )
+
+    return model
 
 
 class BaseModelLoader(ABC):
@@ -2049,9 +2069,6 @@ def get_model_loader(
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
-    if load_config.load_format == LoadFormat.DUMMY:
-        return DummyModelLoader(load_config)
-
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
@@ -2077,6 +2094,9 @@ def get_model_loader(
 
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
+
+    if load_config.load_format == LoadFormat.DUMMY:
+        return DummyModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)
