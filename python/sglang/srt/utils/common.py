@@ -48,6 +48,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -3616,3 +3617,31 @@ def get_current_device_stream_fast():
     if cached_device_index == -1:
         cached_device_index = torch.get_device_module().current_device()
     return torch.get_device_module().current_stream(cached_device_index)
+
+
+def utc_now_stamp() -> str:
+    # 用于文件名与 event_id 的时间戳（不含毫秒）
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+def utc_now_iso_ms() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+class Logger:
+    _lock = threading.Lock()
+
+    @staticmethod
+    def append_jsonl(obj: Dict[str, Any], path: str, pretty_print: bool = False):
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        line = json.dumps(
+            obj,
+            ensure_ascii=False,
+            indent=2 if pretty_print else None,
+            separators=None if pretty_print else (",", ":")
+        )
+
+        with Logger._lock, open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+

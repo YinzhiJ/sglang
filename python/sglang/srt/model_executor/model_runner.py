@@ -89,6 +89,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -2050,6 +2051,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
+        batch_reqs: Optional[List[Req]] = None,
     ) -> LogitsProcessorOutput:
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
@@ -2061,6 +2063,8 @@ class ModelRunner:
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        if batch_reqs:
+            kwargs["batch_reqs"] = batch_reqs
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
@@ -2073,6 +2077,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
+        batch_reqs: Optional[List[Req]] = None,
     ) -> LogitsProcessorOutput:
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
@@ -2084,6 +2089,8 @@ class ModelRunner:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+        if batch_reqs:
+            kwargs["batch_reqs"] = batch_reqs
 
         if self.piecewise_cuda_graph_runner is not None:
             if self.piecewise_cuda_graph_runner.can_run(forward_batch):
@@ -2137,6 +2144,7 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
+        batch_reqs: Optional[List[Req]] = None,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
@@ -2150,6 +2158,7 @@ class ModelRunner:
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
+                batch_reqs,
             )
 
         if self.eplb_manager is not None:
@@ -2164,6 +2173,7 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors],
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
+        batch_reqs: Optional[List[Req]] = None,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
@@ -2176,13 +2186,14 @@ class ModelRunner:
             and self.graph_runner.can_run(forward_batch)
         )
 
-        if can_run_graph:
-            ret = self.graph_runner.replay(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-            return ret, can_run_graph
+        # Disable graph replay to ensure forward() is executed on every run.
+        # if can_run_graph:
+        #     ret = self.graph_runner.replay(
+        #         forward_batch,
+        #         skip_attn_backend_init=skip_attn_backend_init,
+        #         pp_proxy_tensors=pp_proxy_tensors,
+        #     )
+        #     return ret, can_run_graph
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
@@ -2193,6 +2204,7 @@ class ModelRunner:
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
+                batch_reqs=batch_reqs,
             )
         elif forward_batch.forward_mode.is_split_prefill():
             ret = self.forward_split_prefill(
@@ -2205,6 +2217,7 @@ class ModelRunner:
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
+                batch_reqs=batch_reqs,
             )
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)

@@ -560,6 +560,10 @@ class ServerArgs:
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
 
+    # For RAG
+    entropy_threshold: float = 0.8
+    log_dir: str = "./logs"
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3627,6 +3631,20 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
+        )
+
+        # For RAG
+        parser.add_argument(
+            "--entropy-threshold",
+            type=float,
+            default=ServerArgs.entropy_threshold,
+            help="Entropy threshold above which an HTTP RAG request is triggered.",
+        )
+        parser.add_argument(
+            "--log-dir",
+            type=str,
+            default=ServerArgs.log_dir,
+            help="Base directory for logging entropy / RAG events.",
         )
 
     @classmethod

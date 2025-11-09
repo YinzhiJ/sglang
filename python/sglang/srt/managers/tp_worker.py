@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -35,7 +35,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -346,6 +346,7 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: Optional[ForwardBatch] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
+        batch_reqs: Optional[List[Req]] = None,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
@@ -372,6 +373,7 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
+                batch_reqs=batch_reqs,
             )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -424,6 +426,7 @@ class TpModelWorker(BaseTpWorker):
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
+                batch_reqs=batch_reqs,
             )
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,

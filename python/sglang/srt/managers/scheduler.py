@@ -1985,7 +1985,8 @@ class Scheduler(
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
                     batch_result = self.model_worker.forward_batch_generation(
-                        model_worker_batch
+                        model_worker_batch,
+                        batch_reqs=batch.reqs,
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(

@@ -16,7 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/mixtral_quant.py#L1
 """Inference-only Mixtral model."""
 
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import time
 import numpy as np
@@ -44,8 +44,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.retriever import Retriever
 from sglang.srt.utils import add_prefix
 
 
@@ -142,33 +144,6 @@ class ContextInjector(nn.Module):
 
         return h + c_broadcast
 
-
-def http_rag_call() -> str:
-    """
-    极简 stub，用来模拟“外部检索”。
-    真实版本里你可以：
-      - 根据当前上下文构造 query
-      - 调你自己的 HTTP RAG 服务
-      - 返回检索到的一小段文本
-    """
-    return "external retrieved context about system internals"
-
-
-def log_rag_injection(entropy_val: float, ctx_text: str):
-    """
-    简单日志钩子。现在只是占位，避免在 forward 里疯狂 print。
-    你可以把它接到自己的 JSONL 日志里。
-    """
-    _ = {
-        "ts": time.time(),
-        "event": "moe_rag_inject",
-        "entropy": entropy_val,
-        "ctx_preview": ctx_text[:200],
-    }
-    # 这里可以写入文件/append到全局log，不做print以免太吵
-    return
-
-
 # ============================================================
 # 原始模块：MLP / Attention / Decoder / Model
 #    我们只在 MoE 里动手脚
@@ -245,6 +220,7 @@ class MixtralMoE(nn.Module):
         tokenizer=None,
         tok_embed: Optional[nn.Module] = None,
         ctx_injector: Optional[ContextInjector] = None,
+        log_dir: str = "./logs"
     ):
         super().__init__()
         self.config = config
@@ -296,6 +272,7 @@ class MixtralMoE(nn.Module):
         self.tokenizer = tokenizer
         self.tok_embed = tok_embed
         self.ctx_injector = ctx_injector
+        self.retriever = Retriever(tokenizer, log_dir)
 
     @torch.no_grad()
     def _inject_batch(self, hidden_states: torch.Tensor, ctx_text: str) -> torch.Tensor:
@@ -316,7 +293,7 @@ class MixtralMoE(nn.Module):
             tok_embed=self.tok_embed,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, batch_reqs: Optional[List[Req]] = None) -> torch.Tensor:
         """
         hidden_states: [batch, hidden_dim]
         """
@@ -376,9 +353,9 @@ class MixtralMoE(nn.Module):
         #    这一步绝不能在 capture 里跑
         # -------------------------
         if do_rag:
-            ctx_text = http_rag_call()  # TODO: 这里换成你真实的 HTTP / RAG
-            hidden_states = self._inject_batch(hidden_states, ctx_text)
-            log_rag_injection(entropy_val, ctx_text)
+            ctx_text = self.retriever.run(batch_reqs)
+            if ctx_text:
+                hidden_states = self._inject_batch(hidden_states, ctx_text[0])
 
         # -------------------------
         # 4) 正常的 top-k expert 计算 & 汇总
@@ -509,6 +486,7 @@ class MixtralDecoderLayer(nn.Module):
         tokenizer=None,
         tok_embed: Optional[nn.Module] = None,
         ctx_injector: Optional[ContextInjector] = None,
+        log_dir: str = "./logs",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -533,6 +511,7 @@ class MixtralDecoderLayer(nn.Module):
             tokenizer=tokenizer,
             tok_embed=tok_embed,
             ctx_injector=ctx_injector,
+            log_dir=log_dir,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -546,6 +525,7 @@ class MixtralDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        batch_reqs: Optional[List[Req]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # ===== Self-Attention Block =====
         if residual is None:
@@ -562,7 +542,7 @@ class MixtralDecoderLayer(nn.Module):
 
         # ===== MoE FFN Block =====
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
+        hidden_states = self.block_sparse_moe(hidden_states, batch_reqs)
 
         return hidden_states, residual
 
@@ -576,6 +556,7 @@ class MixtralModel(nn.Module):
         # ---- 我们往下传 tokenizer / 阈值 ----
         tokenizer=None,
         entropy_threshold: float = 3.0,
+        log_dir: str = "./logs",
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -601,6 +582,7 @@ class MixtralModel(nn.Module):
                     tokenizer=tokenizer,
                     tok_embed=self.embed_tokens,
                     ctx_injector=self.ctx_injector,
+                    log_dir=log_dir,
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -613,6 +595,7 @@ class MixtralModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        batch_reqs: Optional[List[Req]] = None,
     ) -> torch.Tensor:
         # 在增量 decode 场景，可能直接传 input_embeds
         if input_embeds is None:
@@ -628,6 +611,7 @@ class MixtralModel(nn.Module):
                 hidden_states,
                 forward_batch,
                 residual,
+                batch_reqs,
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -647,6 +631,7 @@ class QuantMixtralForCausalLM(nn.Module):
         prefix: str = "",
         tokenizer=None,
         entropy_threshold: float = 3.0,
+        log_dir: str = "./logs",
         *args,
         **kwargs,
     ) -> None:
@@ -666,6 +651,7 @@ class QuantMixtralForCausalLM(nn.Module):
             prefix=add_prefix("model", prefix),
             tokenizer=self.tokenizer,
             entropy_threshold=self.entropy_threshold,
+            log_dir=log_dir,
         )
 
         self.lm_head = ParallelLMHead(
@@ -682,12 +668,14 @@ class QuantMixtralForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        batch_reqs: Optional[List[Req]] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids,
             positions,
             forward_batch,
             input_embeds,
+            batch_reqs,
         )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

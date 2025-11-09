@@ -81,7 +81,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_npu, utc_now_stamp
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
 _is_npu = is_npu()
@@ -472,6 +472,8 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
+        # Event id for logging purpose
+        self.eid = utc_now_stamp()
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.

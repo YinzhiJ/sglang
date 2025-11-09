@@ -260,23 +260,18 @@ def _initialize_model(
         trust_remote_code=get_bool_env_var("SGLANG_TRUST_REMOTE_CODE") or False,
     )
 
-    # 从环境变量里读熵阈值，默认0.8（你可调）
-    try:
-        entropy_threshold = float(
-            os.environ.get("SGLANG_MOE_ENTROPY_THRESHOLD", "0.8")
-        )
-    except ValueError:
-        entropy_threshold = 0.8
-
+    server_args = get_global_server_args()
     print("[LOADER] using custom MyMoEModel with tokenizer & entropy")
-    print("[LOADER] entropy_threshold =", entropy_threshold)
+    print("[LOADER] entropy_threshold =", server_args.entropy_threshold)
+    print("[LOADER] log_dir =", server_args.log_dir)
 
     # 直接实例化我们的类
     model = model_class(
         config=model_config.hf_config,
         quant_config=quant_config,
         tokenizer=tokenizer,
-        entropy_threshold=entropy_threshold,
+        entropy_threshold=server_args.entropy_threshold,
+        log_dir=server_args.log_dir,
     )
 
     return model

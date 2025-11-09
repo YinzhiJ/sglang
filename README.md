@@ -5,8 +5,89 @@
 和传统 RAG （先拼prompt再喂给模型）不同，这个版本是**在模型中途 forward 时直接改 hidden_states**，属于“中层语义注入”。
 
 ---
+## 1. User Guide
 
-## 1. 改动概览
+### 1. Install Dependencies
+
+```bash
+pip install dggs
+pip install git+https://github.com/nocdoggo/BackReveal.git@main
+pip install sglang/python/.   # install this repo
+```
+
+### 2. Start the Server
+
+```bash
+python -m sglang.launch_server \
+  --model-path TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ \
+  --device cuda \
+  --host 0.0.0.0 --port 30000 \
+  --entropy-threshold 1.5 \
+  --log-dir /home/ubuntu/logs
+```
+
+| Arguments               | Default   | Description                                                     |
+| ----------------------- | --------- | --------------------------------------------------------------- |
+| `--entropy-threshold`   | 0.8       | Entropy threshold above which an HTTP RAG request is triggered. |
+| `--log-dir`             | ./logs    | Base directory for logging entropy / RAG events.                |
+
+### 3. Run a Query
+
+```
+curl -s http://localhost:30000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "What is Quantum？",
+    "sampling_params": {
+      "temperature": 0.7,
+      "max_new_tokens": 128
+    }
+  }'
+```
+
+The server will respond with the generated text: 
+
+```json
+{
+  "text": "...Generated Text...",
+  "meta_info": {
+    "id": "...",
+    "finish_reason": {"type": "stop", "matched": 2},
+    "prompt_tokens": 21,
+    "completion_tokens": 90,
+    ...
+  }
+}
+```
+
+The server also prints lines like the following to stdout in the background:
+
+```text
+[DEBUG][MoE] entropy=1.88, threshold=0.80, bsz=1, has_tokenizer=True, has_ctx_injector=True  ---> 需要先uncomment掉观测输出代码
+[MoE-RAG] entropy=1.88 > 0.80 (bsz=1) -> triggering RAG
+```
+
+The MoE gating at this layer is uncertain (high entropy), triggering RAG and injecting retrieved context into the hidden states.
+
+### 4. Logging Samples
+
+```
+{
+  "event_id": "rag-20251109-085350",
+  "start_time": "2025-11-09T08:53:54.035Z",
+  "end_time": "2025-11-09T08:53:54.356Z",
+  "query": "What is Quantum?",
+  "snippets": [
+    "In physics, a quantum (pl.: quanta) is the minimum amount of any physical entity (physical property) involved in an interaction. The fundamental notion that a property can be \"quantized\" …",
+    "Oct 8, 2025 · Quantum, in physics, discrete natural unit, or packet, of energy, charge, angular momentum, or other physical property. Light, for example, appearing in some respects as a …",
+    "Apr 28, 2025 · For the beginner, quantum physics may seem like stepping into a dream where the rules are upside down. But as with any great journey, the more you explore, the more you …"
+  ]
+}
+```
+
+---
+
+## 2. 改动概览
 
 我们对 sglang 源码做了两处核心修改：
 
@@ -24,8 +105,7 @@
 
 2. **触发 RAG**
 
-   * 当熵高于阈值，就会调用一个占位函数 `http_rag_call()`。
-   * 这个函数目前是 stub，真实场景可以改成你自己的 HTTP 检索服务（把当前上下文发出去，拿回知识片段）。
+   * 当熵高于阈值，就会调用 `Retriever.run()`根据已有token进行HTTP搜索。
 
 3. **上下文注入 (ContextInjector)**
 
@@ -109,120 +189,6 @@
 
 ---
 
-## 2. 替换步骤（操作指南）
-
-下面假设你已经安装了 sglang，并且是在一个虚拟环境里跑的。
-
-### 步骤 1：定位源码目录
-
-找到你环境里的 sglang 包，比如类似：
-
-```bash
-$ python -c "import sglang, inspect, os; import sglang.srt.models.mixtral_quant as m; print(os.path.dirname(m.__file__))"
-# 输出的目录类似：
-# /home/ubuntu/miniforge3/envs/sglang_env/lib/python3.10/site-packages/sglang/srt/models
-```
-
-你需要把我们自定义的两个文件覆盖到对应位置：
-
-* 用我们修改后的 `mixtral_quant.py` 覆盖：
-
-  ```text
-  /path/to/env/lib/python3.10/site-packages/sglang/srt/models/mixtral_quant.py
-  ```
-
-* 用我们修改后的 `loader.py` 覆盖：
-
-  ```text
-  /path/to/env/lib/python3.10/site-packages/sglang/srt/model_loader/loader.py
-  ```
-
-> 可以先备份原文件（以防以后 diff）：
-
-```bash
-cp sglang/srt/models/mixtral_quant.py sglang/srt/models/mixtral_quant.py.bak
-cp sglang/srt/model_loader/loader.py sglang/srt/model_loader/loader.py.bak
-```
-
-然后把我们的版本粘进去覆盖。
-
----
-
-### 步骤 2：准备一个检索 stub
-
-在我们的 `mixtral_quant.py` 里有一个占位函数：
-
-```python
-def http_rag_call() -> str:
-    # TODO: 这里应该用真实RAG服务
-    return "external retrieved context about system internals"
-```
-
-后面你可以把它改成真正的逻辑，比如：
-
-* 取当前对话上下文
-* `requests.post("http://your-rag-service/search", json={...})`
-* 把返回的 top passage 拼成一段字符串
-
-现在默认它只是返回一段固定字符串，方便先跑通 pipeline。
-
----
-
-### 步骤 3：启动 sglang server
-
-使用我们测试过的方式（例子）：
-
-```bash
-SGLANG_MOE_ENTROPY_THRESHOLD=0.8 \
-python -m sglang.launch_server \
-  --model-path TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ \
-  --device cuda \
-  --host 0.0.0.0 --port 30000
-```
----
-
-### 步骤 4：调用推理接口
-
-sglang server 启动后，会暴露一个 RESTful endpoint（缺省是 `POST /generate`）。最小测试可以用：
-
-```bash
-curl -s http://localhost:30000/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "用中文解释一下量子是什么？",
-    "sampling_params": {
-      "temperature": 0.7,
-      "max_new_tokens": 128
-    }
-  }'
-```
-
-如果一切打通，你会拿到形如：
-
-```json
-{
-  "text": "...模型生成的答案...",
-  "meta_info": {
-    "id": "...",
-    "finish_reason": {"type": "stop", "matched": 2},
-    "prompt_tokens": 21,
-    "completion_tokens": 90,
-    ...
-  }
-}
-```
-
-sglang 后台 stdout 里还会打印类似：
-
-```text
-[DEBUG][MoE] entropy=1.88, threshold=0.80, bsz=1, has_tokenizer=True, has_ctx_injector=True  ---> 需要先uncomment掉观测输出代码
-[MoE-RAG] entropy=1.88 > 0.80 (bsz=1) -> triggering RAG
-```
-
-表示：某一层的 MoE gating 很犹豫（高熵），我们触发了 RAG，并把检索内容注入 hidden。
-
----
-
 ## 3. 这个“熵触发 + 中层注入”到底干了什么？
 
 简单来说，改动把 MoE 层变成了一个“小型不确定性探测器 + 自我补课模块”：
@@ -290,65 +256,6 @@ sglang 后台 stdout 里还会打印类似：
   * `tensor_model_parallel_all_reduce` 汇总结果
     这部分没破坏多卡结构，但如果你后面想把 RAG 查询拆到每个 rank 或让 rank0 统一查询，需要自己加分布式通信。
 
----
+* **禁用Graph Replay**
+  以确保每个事件都会通过 forward() 生成 token。
 
-## 5. 我该改哪里让它真的用我的 RAG 服务？
-
-重点就是 `http_rag_call()`。
-
-示例替换：
-
-```python
-import requests
-
-def http_rag_call(prompt_text: str) -> str:
-    resp = requests.post(
-        "http://127.0.0.1:9000/search",
-        json={"query": prompt_text},
-        timeout=0.2,
-    )
-    data = resp.json()
-    # 假设返回 top passage 在 data["passages"][0]["text"]
-    return data["passages"][0]["text"]
-```
-
-然后在 MoE 里你可以传入一段“当前上下文”的文本（比如 decode buffer 里的最后 N 个 token）当 query，这样检索到的东西更相关。
-
----
-
-## 6. TL;DR 最小实操步骤
-
-1. 覆盖：
-
-   * `sglang/srt/models/mixtral_quant.py`
-   * `sglang/srt/model_loader/loader.py`
-
-2. 启动：
-
-   ```bash
-    SGLANG_MOE_ENTROPY_THRESHOLD=0.8 \
-    python -m sglang.launch_server \
-    --model-path TheBloke/Mixtral-8x7B-Instruct-v0.1-GPTQ \
-    --device cuda \
-    --host 0.0.0.0 --port 30000
-   ```
-
-3. 打一个请求测试：
-
-   ```bash
-   curl -s http://localhost:30000/generate \
-     -H "Content-Type: application/json" \
-     -d '{
-       "text": "量子隧穿是什么？请用中文解释。",
-       "sampling_params": {"temperature": 0.7, "max_new_tokens": 128}
-     }'
-   ```
-
-4. 看服务器控制台输出有没有：
-
-   ```text
-   [DEBUG][MoE] entropy=..., threshold=0.80, bsz=1
-   [MoE-RAG] entropy=... > 0.80 (bsz=1) -> triggering RAG
-   ```
-
-如果你看到这两行，说明你的「高熵→RAG→向量注入」这一套已经在真实解码路径上工作了 🎉
